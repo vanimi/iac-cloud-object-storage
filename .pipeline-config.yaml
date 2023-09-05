@@ -1,0 +1,309 @@
+version: '1'
+
+setup:
+  image: icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.16
+  script: |
+    #!/usr/bin/env bash
+
+    if [[ "$(get_env pipeline_namespace)" == *"pr"* ||  "$(get_env pipeline_namespace)" == *"ci"* ]]; then
+      source ${WORKSPACE}/$(get_env ONE_PIPELINE_CONFIG_DIRECTORY_NAME)/scripts/code_setup.sh
+    fi
+
+    source "${COMMONS_PATH}/terraform/terraform-utilities.sh"
+
+    if ! terraform_install; then
+      echo "Failing to get terraform cli. Exiting"
+      exit 1
+    fi
+    # configure .netrc for private module if stored in same git server as source one(s)
+    while read -r repo ; do
+      url="$(load_repo "${repo}" url)"
+      configure_git_and_netrc "$url" "$repo"
+    done < <(list_repos)
+
+    if [[ "$(get_env pipeline_namespace)" == *"pr"* ||  "$(get_env pipeline_namespace)" == *"ci"* ]]; then
+      # Install shellcheck as a complementary tool
+      # only enabling repository containing the xz compression tool
+      yum install -y xz
+      SHELLCHECK_VERSION=v0.8.0
+      FILE_NAME="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+      URL="https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}"
+      TMP_DIR=$(mktemp -d)
+      curl -L "$URL/$FILE_NAME" -o $TMP_DIR/shellcheck.tar.xz
+      tar --extract --file=$TMP_DIR/shellcheck.tar.xz --strip-components=1 shellcheck-$SHELLCHECK_VERSION/shellcheck && mv shellcheck /usr/local/bin
+
+      source ${WORKSPACE}/$(get_env ONE_PIPELINE_CONFIG_DIRECTORY_NAME)/scripts/pre-commit-utility.sh
+      exit_code=0
+      while read -r repo ; do
+        path="$(load_repo "${repo}" path)"
+        cd "${WORKSPACE}/$path"
+        if [ -f ".gitmodules" ]; then
+          git submodule update --init --recursive
+        fi
+        run-pre-commit || exit_code=$?
+        pre_commit_status=$((pre_commit_status+exit_code))
+      done < <(list_repos)
+
+      exit $pre_commit_status
+    fi
+
+test:
+  abort_on_failure: false
+  image: golang:1.18-buster
+  script: |
+    #!/usr/bin/env bash
+
+    if [ -d "$WORKSPACE/$(load_repo app-repo path)/test" ]; then
+      cd "$WORKSPACE/$(load_repo app-repo path)/test"
+
+      source "${COMMONS_PATH}/terraform/terraform-utilities.sh"
+
+      # Install jq on top golang image
+      if ! which jq &>/dev/null; then
+        apt-get update -qq && apt-get install -y -qq jq
+      fi
+      jq --version
+
+      if ! terraform_install; then
+        echo "Failing to get terraform cli. Exiting"
+        exit 1
+      fi
+      # configure .netrc for private module if stored in same git server as source one(s)
+      while read -r repo ; do
+        url="$(load_repo "${repo}" url)"
+        configure_git_and_netrc "$url" "$repo"
+      done < <(list_repos)
+
+      # prepare terraform context (tfvars & TF_VAR export)
+      terraform_tfvars_setup
+      terraform_env_export
+
+      # install terra_test_log utility
+      go install github.com/gruntwork-io/terratest/cmd/terratest_log_parser@latest
+
+      # run tests
+      tests_log=$(mktemp --suffix=.log)
+      exit_code=0
+      go test -v -timeout 15m | tee $tests_log
+      exit_code="${PIPESTATUS[0]}"
+
+      # save status for new evidence collection
+      status="success"
+      if [ "$exit_code" != "0" ]; then
+        status="failure"
+      fi
+      evidence_params=(
+        --tool-type "terratest" \
+        --status "${status}" \
+        --evidence-type "com.ibm.unit_tests" \
+        --asset-type "repo" \
+        --asset-key "app-repo"
+      )
+
+      # parser test output to create appropriate file for test
+      test_output=$(mktemp -d)
+      terratest_log_parser -testlog $tests_log -outputdir $test_output
+      for file in $test_output/*;
+      do
+        evidence_params+=(
+          --attachment "${file}"
+        )
+      done
+
+      collect-evidence "${evidence_params[@]}"
+
+      exit $exit_code
+    fi
+
+sign-artifact:
+  image: icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.16
+  abort_on_failure: false
+  script: |
+    #!/bin/bash
+
+    source "${COMMONS_PATH}/sign-artifact/sign-artifacts.sh"
+
+deploy:
+  image: icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.16
+  abort_on_failure: true
+  script: |
+    #!/bin/bash
+
+    if [[ -z "$(get_env tf-backend-s3-bucket '')" ]]; then
+      source "${COMMONS_PATH}/infrastructure-as-code/deploy-using-schematics.sh"
+    else
+      source "${COMMONS_PATH}/infrastructure-as-code/deploy-using-terraform.sh"
+    fi
+
+    if [[ "$(get_env pipeline_namespace)" == *"cd"* ]]; then
+
+      source "${COMMONS_PATH}/infrastructure-as-code/fetch-artifact.sh"
+      source "${COMMONS_PATH}/change-request/change-request-utilities.sh"
+
+      INVENTORY_PATH="$(get_env inventory-path)"
+      DEPLOYMENT_DELTA_PATH="$(get_env deployment-delta-path)"
+
+      echo "Target environment: $(get_env environment)"
+      echo "Deployment Delta (inventory entries with updated artifacts)"
+      jq '.' "$DEPLOYMENT_DELTA_PATH"
+      echo ""
+
+      #
+      # iterate over inventory deployment delta
+      #
+      for INVENTORY_ENTRY in $(jq -r '.[]' $DEPLOYMENT_DELTA_PATH); do
+        echo "==============================================="
+        echo "Deploying $INVENTORY_ENTRY"
+        if fetch-artifact $INVENTORY_ENTRY; then
+          exit_code=0
+          # invoke the deployment action
+          if [[ -z "$(get_env tf-backend-s3-bucket '')" ]]; then
+            deploy-using-schematics "${INVENTORY_ENTRY}" || exit_code=$?
+          else
+            deploy-using-terraform "${INVENTORY_ENTRY}" || exit_code=$?
+          fi
+          if [ "$exit_code" != "0" ]; then
+            # Failure in the deployment action
+            echo "Deployment action for $INVENTORY_ENTRY failed - Exiting $exit_code"
+            exit $exit_code
+          fi
+          if [ -z "$(get_env CHANGE_REQUEST_ID '')" ]; then
+            # Can occur with Dev-Mode Listener that is not creating Change Request
+            echo "No change request referenced - skipping plan attachment"
+          else
+            # Add terraform plan to the change request
+            add-attachment-to-change-request "$(get_env iac_plan_output)" "Terraform Plan for ${INVENTORY_ENTRY}"
+          fi
+          # Keep the plan for the deployed inventory in a proper set_env entry also
+          set_env "iac_plan_output_${INVENTORY_ENTRY}" "$(get_env iac_plan_output)"
+          # Keep the output of the deployed inventory in a proper set_env entry also
+          set_env "iac_apply_output_${INVENTORY_ENTRY}" "$(get_env iac_apply_output)"
+          echo ""
+          echo "==============================================="
+        else
+          echo "Error while fetching $INVENTORY_ENTRY. Exiting 1"
+          exit 1
+        fi
+      done
+    else
+      # deploy-dev stage for CI pipeline
+      exit_code=0
+      if [[ -z "$(get_env tf-backend-s3-bucket '')" ]]; then
+        deploy-using-schematics || exit_code=$?
+      else
+        deploy-using-terraform || exit_code=$?
+      fi
+      if [ "$exit_code" != "0" ]; then
+        # Failure in the deployment action
+        echo "Deployment action failed - Exiting $exit_code"
+        exit $exit_code
+      fi
+    fi
+
+acceptance-test:
+  abort_on_failure: false
+  image: icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.16
+  script: |
+    #!/bin/bash
+
+    if [[ "$(get_env pipeline_namespace)" == *"ci"* ]]; then
+      # Acceptance test would be in the source repository
+      cd "$WORKSPACE/$(load_repo app-repo path)"
+    else
+      # Acceptance test would be in the pipeline-config repository
+      cd "${WORKSPACE}/$(get_env ONE_PIPELINE_CONFIG_DIRECTORY_NAME)"
+    fi
+
+    # Check for acceptance-test folder in the source
+    if [ -d "acceptance-test" ]; then
+      cd "acceptance-test"
+
+      npm ci
+
+      # export TF_VAR
+      source "${COMMONS_PATH}/terraform/terraform-utilities.sh"
+
+      terraform_env_export
+
+      # make output entry as exported environment variable
+      echo "Processing outputs of apply to export environment variables"
+      apply_output_file=$(get_env iac_apply_output "")
+      if [ -n "$apply_output_file" ]; then
+        while IFS= read -r line
+        do
+          echo "$line"
+          eval "$line"
+        done < <(jq -r '. as $doc | keys[] | . as $key | $doc | ("export " + $key + "="+ .[$key].value)' "$apply_output_file")
+      fi
+
+      # save exit code for old evidence collection
+      exit_code=0
+      npm run acceptance-test || exit_code=$?
+
+      # save status for new evidence collection
+      status="success"
+      if [ "$exit_code" != "0" ]; then
+        status="failure"
+      fi
+
+      evidence_params=(
+        --tool-type "jest" \
+        --evidence-type "com.ibm.acceptance_tests" \
+        --status "$status"
+      )
+
+      if [[ "$(get_env pipeline_namespace)" == *"ci"* ]]; then
+        collect-evidence "${evidence_params[@]}" \
+          --asset-type "repo" \
+          --asset-key "app-repo"
+      else
+        # For CD the acceptance test results are associated to every artifacts and repos involved
+        list_artifacts | while read -r artifact; do
+          collect-evidence "${evidence_params[@]}" \
+            --asset-type "artifact" \
+            --asset-key "${artifact}"
+        done
+      fi
+
+      exit $exit_code
+
+    fi
+
+release:
+  abort_on_failure: true
+  image: icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.16
+  script: |
+    #!/usr/bin/env bash
+
+    source "${COMMONS_PATH}/infrastructure-as-code/helpers.sh"
+
+    if [ -n "$(get_env skip-inventory-update-on-failure "")" ]; then
+      # check if the compliance status checks are successfull
+      # do not create a release and update inventory if compliance checks are not succesfull
+      if ! check-compliance-statuses; then
+          echo "Skipping release stage as compliance checks are not successfull."
+          exit 0
+      fi
+    fi
+
+    exit_code=0
+    chmod +x "${WORKSPACE}/$(get_env ONE_PIPELINE_CONFIG_DIRECTORY_NAME)/scripts/run-semantic-release.sh"
+    "${WORKSPACE}/$(get_env ONE_PIPELINE_CONFIG_DIRECTORY_NAME)/scripts/run-semantic-release.sh" || exit_code=$?
+    if [ "$exit_code" != "0" ]; then
+      echo "Failure in the semantic release creation process - Exiting $exit_code"
+      exit $exit_code
+    fi
+
+    chmod +x "${WORKSPACE}/$(get_env ONE_PIPELINE_CONFIG_DIRECTORY_NAME)/scripts/release.sh"
+    "${WORKSPACE}/$(get_env ONE_PIPELINE_CONFIG_DIRECTORY_NAME)/scripts/release.sh" || exit_code=$?
+    if [ "$exit_code" != "0" ]; then
+      echo "Failure in the release/inventory process - Exiting $exit_code"
+      exit $exit_code
+    fi
+
+    chmod +x "${WORKSPACE}/$(get_env ONE_PIPELINE_CONFIG_DIRECTORY_NAME)/scripts/sign-tag.sh"
+    "${WORKSPACE}/$(get_env ONE_PIPELINE_CONFIG_DIRECTORY_NAME)/scripts/sign-tag.sh" || exit_code=$?
+    if [ "$exit_code" != "0" ]; then
+      echo "Failure in the tag signature - Exiting $exit_code"
+      exit $exit_code
+    fi
