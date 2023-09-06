@@ -12,7 +12,7 @@ variable "ibm_region" {
 variable "resource_group" {
   description = "name of resource group used for the service(s) obtained or created"
   type        = string
-  default     = "test"
+  default     = "default"
 }
 
 variable "cos_instance" {
