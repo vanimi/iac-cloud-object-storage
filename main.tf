@@ -13,7 +13,7 @@ resource "ibm_resource_instance" "cos_instance1" {
 resource "ibm_cos_bucket" "cos_bucket" {
   bucket_name          = var.cos_bucket_name
   resource_instance_id = ibm_resource_instance.cos_instance1.id
-  #   single_site_location = "ams03" #inject failure
-  cross_region_location = "us"
-  storage_class         = "standard"
+  single_site_location = "ams03" #inject failure
+  # cross_region_location = "us"
+  storage_class = "standard"
 }
