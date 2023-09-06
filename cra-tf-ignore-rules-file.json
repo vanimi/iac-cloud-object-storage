@@ -1,0 +1,19 @@
+{
+    "scc_rules": [
+        {
+            "scc_rule_id": "rule-7c86bb59-d677-422d-875c-0259053fad20"
+        },
+        {
+            "scc_rule_id": "rule-8cbd597c-7471-42bd-9c88-36b2696456e9"
+        },
+        {
+            "scc_rule_id": "rule-c97259ee-336d-4c5f-b436-1868107a9558"
+        },
+        {
+            "scc_rule_id": "rule-da567ec9-8e24-4c65-993b-ad290bfdb855"
+        },
+        {
+            "scc_rule_id": "rule-0fb54bb2-773b-4cec-81b0-1ca7d8049ba0"
+        }
+    ]
+}
