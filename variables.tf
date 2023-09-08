@@ -24,5 +24,5 @@ variable "cos_instance" {
 variable "cos_bucket_name" {
   description = "name of the cos bucket"
   type        = string
-  default     = "test-cos-bucket"
+  default     = "vani-test-cos-bucket"
 }
