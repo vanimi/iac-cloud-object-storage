@@ -7,7 +7,7 @@ resource "ibm_resource_instance" "cos_instance1" {
   resource_group_id = data.ibm_resource_group.cos_group.id
   service           = "cloud-object-storage"
   plan              = "lite"
-  location          = var.ibm_region
+  location          = "global"
 }
 
 resource "ibm_cos_bucket" "cos_bucket" {
